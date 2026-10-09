@@ -1,0 +1,131 @@
+name: Mirror FFmpeg
+
+# Manual run (Actions → Run workflow) when we decide to ship a new FFmpeg
+# version (after testing it in c2x). Recommended every 3–6 months, or right
+# away for security fixes. Only FFmpeg is mirrored in this public repo.
+on:
+  workflow_dispatch:
+    inputs:
+      ffmpeg_branch:
+        description: 'FFmpeg release branch (BtbN n<branch>; macOS = latest release build of that branch)'
+        default: '9.0'
+      force:
+        description: 'Re-upload even if the release already exists'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      has_ffmpeg: ${{ steps.plan.outputs.has_ffmpeg }}
+      has_any: ${{ steps.plan.outputs.has_any }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download + repackage
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          # Inputs only via env (no expression text inside the script).
+          FFMPEG_BRANCH: ${{ inputs.ffmpeg_branch || '9.0' }}
+          FORCE: ${{ inputs.force && '--force' || '' }}
+        run: |
+          python3 scripts/mirror.py prepare --tools ffmpeg \
+            --ffmpeg-branch "$FFMPEG_BRANCH" $FORCE
+      - name: Check Linux x64 FFmpeg (encoders + -/option + -fpre)
+        if: hashFiles('dist/ffmpeg/ffmpeg-linux-x64.tar.gz') != ''
+        run: |
+          mkdir -p t && tar -xzf dist/ffmpeg/ffmpeg-linux-x64.tar.gz -C t
+          ./t/ffmpeg -hide_banner -version | head -1
+          E=$(./t/ffmpeg -hide_banner -encoders)
+          for e in libsvtav1 libx264 libx265; do echo "$E" | grep -q "$e" || { echo "❌ missing $e"; exit 1; }; done
+          printf 'crf=30\n' > p.ffpreset; printf 'scale=160:-2' > vf.txt; printf 'libx264' > cv.txt
+          ./t/ffmpeg -hide_banner -v error -f lavfi -i testsrc=d=1 -/c:v cv.txt -fpre p.ffpreset -/vf vf.txt -f null -
+          echo "✅ Linux x64 OK"
+      - name: Plan summary
+        id: plan
+        run: |
+          cat dist/plan.json
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json
+          p = json.load(open('dist/plan.json'))
+          print('has_ffmpeg=' + ('true' if 'ffmpeg' in p else 'false'))
+          print('has_any=' + ('true' if p else 'false'))
+          EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 3
+
+  # macOS: the arm64 build must contain VideoToolbox + the CPU encoders,
+  # carry a valid signature and accept c2x's hidden-argument syntax.
+  verify-macos:
+    needs: prepare
+    if: needs.prepare.outputs.has_ffmpeg == 'true'
+    runs-on: macos-14
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: dist, path: dist }
+      - run: |
+          mkdir t && ditto -x -k dist/ffmpeg/ffmpeg-macos-arm64.zip t
+          codesign --verify --verbose t/ffmpeg t/ffprobe
+          ./t/ffmpeg -hide_banner -version | head -1
+          E=$(./t/ffmpeg -hide_banner -encoders)
+          for e in h264_videotoolbox hevc_videotoolbox libsvtav1 libx264 libx265; do
+            echo "$E" | grep -q "$e" || { echo "❌ missing $e"; exit 1; }
+          done
+          ./t/ffmpeg -hide_banner -filters | grep -q libvmaf || echo "⚠️ no libvmaf (VMAF disabled in app, PSNR/SSIM still work)"
+          printf 'crf=30\n' > p.ffpreset; printf 'scale=160:-2' > vf.txt; printf 'libx264' > cv.txt
+          ./t/ffmpeg -hide_banner -v error -f lavfi -i testsrc=d=1 -/c:v cv.txt -fpre p.ffpreset -/vf vf.txt -f null -
+          mkdir x && ditto -x -k dist/ffmpeg/ffmpeg-macos-x64.zip x
+          lipo -info x/ffmpeg | grep -q x86_64
+          codesign --verify --verbose x/ffmpeg
+          echo "✅ macOS OK"
+
+  verify-windows:
+    needs: prepare
+    if: needs.prepare.outputs.has_ffmpeg == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: dist, path: dist }
+      - shell: pwsh
+        run: |
+          Expand-Archive dist/ffmpeg/ffmpeg-windows-x64.zip -DestinationPath t
+          ./t/ffmpeg.exe -hide_banner -version | Select-Object -First 1
+          $e = ./t/ffmpeg.exe -hide_banner -encoders | Out-String
+          foreach ($n in 'libsvtav1','libx264','libx265','h264_nvenc','h264_qsv','h264_amf') {
+            if ($e -notmatch $n) { Write-Host "missing $n"; if ($n -like 'lib*') { exit 1 } }
+          }
+          Set-Content -NoNewline p.ffpreset "crf=30`n"   # LF like the app writes
+          Set-Content -NoNewline vf.txt "scale=160:-2"
+          Set-Content -NoNewline cv.txt "libx264"
+          ./t/ffmpeg.exe -hide_banner -v error -f lavfi -i testsrc=d=1 -/c:v cv.txt -fpre p.ffpreset -/vf vf.txt -f null -
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Write-Host "Windows OK"
+
+  publish:
+    needs: [prepare, verify-macos, verify-windows]
+    # verify jobs are skipped when no FFmpeg is mirrored → still publish.
+    if: >-
+      always() && needs.prepare.result == 'success' &&
+      needs.prepare.outputs.has_any == 'true' &&
+      !contains(fromJSON('["failure","cancelled"]'), needs.verify-macos.result) &&
+      !contains(fromJSON('["failure","cancelled"]'), needs.verify-windows.result)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: dist, path: dist }
+      - name: Create releases + update tools.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/mirror.py publish
