@@ -105,9 +105,10 @@ jobs:
           foreach ($n in 'libsvtav1','libx264','libx265','h264_nvenc','h264_qsv','h264_amf') {
             if ($e -notmatch $n) { Write-Host "missing $n"; if ($n -like 'lib*') { exit 1 } }
           }
-          Set-Content -NoNewline p.ffpreset "crf=30`n"   # LF like the app writes
-          Set-Content -NoNewline vf.txt "scale=160:-2"
-          Set-Content -NoNewline cv.txt "libx264"
+          # Write the test files exactly like the app does (UTF-8, LF, no BOM).
+          [IO.File]::WriteAllText("$PWD\p.ffpreset", "crf=30`n")
+          [IO.File]::WriteAllText("$PWD\vf.txt", "scale=160:-2")
+          [IO.File]::WriteAllText("$PWD\cv.txt", "libx264")
           ./t/ffmpeg.exe -hide_banner -v error -f lavfi -i testsrc=d=1 -/c:v cv.txt -fpre p.ffpreset -/vf vf.txt -f null -
           if ($LASTEXITCODE -ne 0) { exit 1 }
           Write-Host "Windows OK"
